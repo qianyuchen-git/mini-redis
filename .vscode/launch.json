@@ -1,0 +1,74 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Chrome",
+            "request": "launch",
+            "type": "chrome",
+            "url": "http://localhost:8080",
+            "webRoot": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug mini-redis",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=mini-redis",
+                    "--package=mini-redis"
+                ],
+                "filter": {
+                    "name": "mini-redis",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "sourceLanguages": ["rust"]
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug mini-redis (release)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--release",
+                    "--bin=mini-redis",
+                    "--package=mini-redis"
+                ],
+                "filter": {
+                    "name": "mini-redis",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "sourceLanguages": ["rust"]
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug tests",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--lib",
+                    "--package=mini-redis"
+                ],
+                "filter": {
+                    "name": "mini-redis",
+                    "kind": "lib"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "sourceLanguages": ["rust"]
+        }
+    ]
+}

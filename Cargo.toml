@@ -1,0 +1,16 @@
+[package]
+name = "mini-redis"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.48.0", features = ["full"] }
+bytes = "1.5"
+rand = "0.8"
+
+[profile.dev]
+debug = true
+opt-level = 0
+
+[profile.release]
+debug = true
