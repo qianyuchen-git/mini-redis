@@ -2,7 +2,7 @@
 
 use crate::db::{Database, Value, ValueType, load_rdb, save_rdb};
 use crate::queue::CommandQueue;
-use crate::resp::{RespEncoder, RespParser, RespValue};
+use crate::resp::{self, RespEncoder, RespParser, RespValue};
 use std::collections::HashMap;
 use std::io;
 use std::process::Command;
@@ -24,6 +24,19 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
     println!("Mini-Redis listening on {}", addr);
     let mut db = Database::new();
     load_rdb(&mut db, "dump.rdb").ok();
+    tokio::spawn(async move {
+        loop {
+            if rx_cmd.capacity() == 0 {
+                break;
+            }
+            if let Some((command, resp_tx)) = rx_cmd.recv().await {
+                let response = execute_command(&command, &mut db);
+                resp_tx.send(response).unwrap();
+            } else {
+                break;
+            }
+        }
+    });
     loop {
         let (mut socket, peer_addr) = listener.accept().await?;
         println!("New connection from {}", peer_addr);
@@ -47,39 +60,6 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                 }
             }
         });
-        loop {
-            if rx_cmd.capacity() == 0 {
-                break;
-            }
-            if let Some((command, resp_tx)) = rx_cmd.recv().await {
-                let response = execute_command(&command, &mut db);
-                resp_tx.send(response).unwrap();
-            } else {
-                break;
-            }
-        }
-    }
-}
-
-async fn handle_client(mut socket: TcpStream, db: Arc<Mutex<Database>>) -> io::Result<()> {
-    let mut parser = RespParser::new();
-    print!("Handling new client\n");
-    loop {
-        // 你的神级函数：内部自动处理流式读 + 解析
-        if let Some(command) = parser.read_value(&mut socket).await? {
-            println!("Received command: {:?}", command);
-            let response = {
-                let mut db_guard = db.lock().unwrap(); // 锁在这里
-                execute_command(&command, &mut *db_guard)
-            }; // guard 离开作用域，锁自动释放
-            let resp_bytes = RespEncoder::encode_resp(&response);
-
-            socket.write_all(&resp_bytes).await?;
-            socket.flush().await?;
-        } else {
-            print!("Client disconnected\n");
-            return Ok(()); // 连接关闭
-        }
     }
 }
 
@@ -133,7 +113,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
         }
 
         "SET" => {
-            if array.len() != 3 {
+            if array.len() < 3 || array.len() > 6 {
                 return RespValue::Error("ERR wrong number of arguments for SET".to_string());
             }
 
@@ -147,17 +127,36 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 RespValue::BulkString(Some(v)) => v.clone(),
                 _ => return RespValue::Error("ERR invalid value".to_string()),
             };
-
             let mut curr_db = _db.get_current();
-            curr_db.insert(
-                key,
-                Value {
-                    data: ValueType::String(value),
-                    expire_at: None,
-                },
-            );
+            match array.len() {
+                3 => {
+                    //only key and value
+                    curr_db.insert(
+                        key,
+                        Value {
+                            data: ValueType::String(value),
+                            expire_at: None,
+                        },
+                    );
 
-            RespValue::SimpleString("OK".to_string())
+                    RespValue::SimpleString("OK".to_string())
+                }
+                4 => {
+                    match &array[3] {
+                        RespValue::BulkString(Some(opt))=> {
+                            let opt_str = String::from_utf8_lossy(opt).to_ascii_uppercase();
+                            if opt_str == "EX" {
+                                RespValue::Error("ERR syntax error".to_string())
+                            } else {
+                                RespValue::Error("ERR unknown option".to_string())
+                            }
+                        }
+                        _ => RespValue::Error("ERR invalid option".to_string()),
+                    }
+                }
+                5 => {}
+                6 => {}
+            }
         }
 
         "GET" => {
@@ -385,6 +384,66 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
         "SAVE" => {
             save_rdb(_db, "dump.rdb").ok();
             RespValue::SimpleString("OK".to_string())
+        }
+
+        "EXPIRE" => {
+            if array.len() != 3 {
+                return RespValue::Error("ERR wrong number of arguments for EXPIRE".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let value = match &array[2] {
+                RespValue::BulkString(Some(v)) => v.clone(),
+                _ => return RespValue::Error("ERR invalid value".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            curr_db.get_mut(key.as_str()).map_or_else(
+                || RespValue::Integer(0),
+                |v| {
+                    let expire_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs()
+                        + String::from_utf8_lossy(&value).parse::<u64>().unwrap_or(0);
+                    v.expire_at = Some(expire_at);
+                    RespValue::Integer(1)
+                },
+            )
+        }
+
+        "TTL" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for TTL".to_string());
+            }
+
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+                    match v.expire_at {
+                        Some(expire) if expire > now => {
+                            resp::RespValue::Integer((expire - now) as i64)
+                        }
+                        Some(_) => {
+                            curr_db.remove(&key); // 惰性删除
+                            resp::RespValue::Integer(-2) // key不存在
+                        }
+                        None => resp::RespValue::Integer(-1), // key存在但没有过期时间
+                    }
+                }
+                None => resp::RespValue::Integer(-2), // key不存在
+            }
         }
         _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
     }
