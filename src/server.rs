@@ -141,21 +141,148 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
 
                     RespValue::SimpleString("OK".to_string())
                 }
-                4 => {
-                    match &array[3] {
-                        RespValue::BulkString(Some(opt))=> {
-                            let opt_str = String::from_utf8_lossy(opt).to_ascii_uppercase();
-                            if opt_str == "EX" {
-                                RespValue::Error("ERR syntax error".to_string())
+                4 => match &array[3] {
+                    RespValue::BulkString(Some(opt)) => {
+                        let opt_str = String::from_utf8_lossy(opt).to_ascii_uppercase();
+                        if opt_str == "NX" {
+                            curr_db.entry(key).or_insert(Value {
+                                data: ValueType::String(value),
+                                expire_at: None,
+                            });
+                            RespValue::SimpleString("OK".to_string())
+                        } else if opt_str == "XX" {
+                            if let Some(existing) = curr_db.get_mut(&key) {
+                                existing.data = ValueType::String(value);
+                                existing.expire_at = None;
+                                RespValue::SimpleString("OK".to_string())
                             } else {
-                                RespValue::Error("ERR unknown option".to_string())
+                                RespValue::SimpleString("OK".to_string())
                             }
+                        } else {
+                            RespValue::Error("ERR unknown option".to_string())
                         }
-                        _ => RespValue::Error("ERR invalid option".to_string()),
+                    }
+                    _ => RespValue::Error("ERR invalid option".to_string()),
+                },
+                5 => {
+                    let opt = match &array[3] {
+                        RespValue::BulkString(Some(opt)) => {
+                            String::from_utf8_lossy(opt).to_ascii_uppercase()
+                        }
+                        _ => return RespValue::Error("ERR invalid option".to_string()),
+                    };
+                    let expire_time = match &array[4] {
+                        RespValue::BulkString(Some(v)) => {
+                            String::from_utf8_lossy(v).parse::<u64>().unwrap_or(0)
+                        }
+                        _ => return RespValue::Error("ERR invalid expire time".to_string()),
+                    };
+                    if opt == "EX" {
+                        let expire_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs()
+                            + expire_time;
+                        curr_db.insert(
+                            key,
+                            Value {
+                                data: ValueType::String(value),
+                                expire_at: Some(expire_at),
+                            },
+                        );
+                        RespValue::SimpleString("OK".to_string())
+                    } else if opt == "PX" {
+                        let expire_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs()
+                            + expire_time / 1000;
+                        curr_db.insert(
+                            key,
+                            Value {
+                                data: ValueType::String(value),
+                                expire_at: Some(expire_at),
+                            },
+                        );
+                        RespValue::SimpleString("OK".to_string())
+                    } else {
+                        RespValue::Error("ERR unknown option".to_string())
                     }
                 }
-                5 => {}
-                6 => {}
+                6 => {
+                    let opt1 = match &array[3] {
+                        RespValue::BulkString(Some(opt)) => {
+                            String::from_utf8_lossy(opt).to_ascii_uppercase()
+                        }
+                        _ => return RespValue::Error("ERR invalid option".to_string()),
+                    };
+                    let expire_time = match &array[4] {
+                        RespValue::BulkString(Some(v)) => {
+                            String::from_utf8_lossy(v).parse::<u64>().unwrap_or(0)
+                        }
+                        _ => return RespValue::Error("ERR invalid expire time".to_string()),
+                    };
+                    let opt2 = match &array[5] {
+                        RespValue::BulkString(Some(opt)) => {
+                            String::from_utf8_lossy(opt).to_ascii_uppercase()
+                        }
+                        _ => return RespValue::Error("ERR invalid option".to_string()),
+                    };
+                    if (opt1 == "NX" && opt2 == "EX") || (opt1 == "EX" && opt2 == "NX") {
+                        let expire_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs()
+                            + expire_time;
+                        curr_db.entry(key).or_insert(Value {
+                            data: ValueType::String(value),
+                            expire_at: Some(expire_at),
+                        });
+                        RespValue::SimpleString("OK".to_string())
+                    } else if (opt1 == "XX" && opt2 == "EX") || (opt1 == "EX" && opt2 == "XX") {
+                        if let Some(existing) = curr_db.get_mut(&key) {
+                            existing.data = ValueType::String(value);
+                            existing.expire_at = Some(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or(Duration::ZERO)
+                                    .as_secs()
+                                    + expire_time,
+                            );
+                            RespValue::SimpleString("OK".to_string())
+                        } else {
+                            RespValue::SimpleString("OK".to_string())
+                        }
+                    } else if (opt1 == "NX" && opt2 == "PX") || (opt1 == "PX" && opt2 == "NX") {
+                        let expire_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs()
+                            + expire_time / 1000;
+                        curr_db.entry(key).or_insert(Value {
+                            data: ValueType::String(value),
+                            expire_at: Some(expire_at),
+                        });
+                        RespValue::SimpleString("OK".to_string())
+                    } else if (opt1 == "XX" && opt2 == "PX") || (opt1 == "PX" && opt2 == "XX") {
+                        if let Some(existing) = curr_db.get_mut(&key) {
+                            existing.data = ValueType::String(value);
+                            existing.expire_at = Some(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or(Duration::ZERO)
+                                    .as_secs()
+                                    + expire_time / 1000,
+                            );
+                            RespValue::SimpleString("OK".to_string())
+                        } else {
+                            RespValue::SimpleString("OK".to_string())
+                        }
+                    } else {
+                        RespValue::Error("ERR unknown option combination".to_string())
+                    }
+                }
+                _ => RespValue::Error("ERR wrong number of arguments for SET".to_string()),
             }
         }
 
@@ -444,6 +571,143 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 }
                 None => resp::RespValue::Integer(-2), // key不存在
             }
+        }
+
+        "INCR" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for INCR".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            match curr_db.get_mut(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            curr_db.insert(
+                                key,
+                                Value {
+                                    data: ValueType::String(b"1".to_vec()),
+                                    expire_at: None,
+                                },
+                            );
+                            return RespValue::Integer(1);
+                        }
+                    }
+
+                    match &mut v.data {
+                        ValueType::String(s) => {
+                            let num = String::from_utf8_lossy(s).parse::<i64>();
+                            match num {
+                                Ok(n) => {
+                                    let new_val = n + 1;
+                                    *s = new_val.to_string().as_bytes().to_vec();
+                                    RespValue::Integer(new_val)
+                                }
+                                Err(_) => {
+                                    RespValue::Error("ERR value is not an integer".to_string())
+                                }
+                            }
+                        }
+                        _ => RespValue::Error("ERR value is not an integer".to_string()),
+                    }
+                }
+                None => {
+                    curr_db.insert(
+                        key,
+                        Value {
+                            data: ValueType::String(b"1".to_vec()),
+                            expire_at: None,
+                        },
+                    );
+                    RespValue::Integer(1)
+                }
+            }
+        }
+
+        "DECR" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for DECR".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            match curr_db.get_mut(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            curr_db.insert(
+                                key,
+                                Value {
+                                    data: ValueType::String(b"-1".to_vec()),
+                                    expire_at: None,
+                                },
+                            );
+                            return RespValue::Integer(-1);
+                        }
+                    }
+
+                    match &mut v.data {
+                        ValueType::String(s) => {
+                            let num = String::from_utf8_lossy(s).parse::<i64>();
+                            match num {
+                                Ok(n) => {
+                                    let new_val = n - 1;
+                                    *s = new_val.to_string().as_bytes().to_vec();
+                                    RespValue::Integer(new_val)
+                                }
+                                Err(_) => {
+                                    RespValue::Error("ERR value is not an integer".to_string())
+                                }
+                            }
+                        }
+                        _ => RespValue::Error("ERR value is not an integer".to_string()),
+                    }
+                }
+                None => {
+                    curr_db.insert(
+                        key,
+                        Value {
+                            data: ValueType::String(b"-1".to_vec()),
+                            expire_at: None,
+                        },
+                    );
+                    RespValue::Integer(-1)
+                }
+            }
+        }
+
+        "INCRBY" => {
+            if array.len() != 3 {
+                return RespValue::Error("ERR wrong number of arguments for INCRBY".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let increment = match &array[2] {
+                RespValue::BulkString(Some(v)) => String::from_utf8_lossy(v).parse::<i64>(),
+                _ => return RespValue::Error("ERR invalid increment".to_string()),
+            };
         }
         _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
     }
