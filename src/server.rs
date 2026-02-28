@@ -705,9 +705,252 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 _ => return RespValue::Error("ERR invalid key".to_string()),
             };
             let increment = match &array[2] {
-                RespValue::BulkString(Some(v)) => String::from_utf8_lossy(v).parse::<i64>(),
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return RespValue::Error("ERR increment is not an integer".to_string());
+                    }
+                },
                 _ => return RespValue::Error("ERR invalid increment".to_string()),
             };
+            let mut curr_db = _db.get_current();
+            match curr_db.get_mut(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            curr_db.insert(
+                                key,
+                                Value {
+                                    data: ValueType::String(
+                                        increment.to_string().as_bytes().to_vec(),
+                                    ),
+                                    expire_at: None,
+                                },
+                            );
+                            return RespValue::Integer(increment);
+                        }
+                    }
+
+                    match &mut v.data {
+                        ValueType::String(s) => {
+                            let num = String::from_utf8_lossy(s).parse::<i64>();
+                            match num {
+                                Ok(n) => {
+                                    let new_val = n + increment;
+                                    *s = new_val.to_string().as_bytes().to_vec();
+                                    RespValue::Integer(new_val)
+                                }
+                                Err(_) => {
+                                    RespValue::Error("ERR value is not an integer".to_string())
+                                }
+                            }
+                        }
+                        _ => RespValue::Error("ERR value is not an integer".to_string()),
+                    }
+                }
+                None => {
+                    curr_db.insert(
+                        key,
+                        Value {
+                            data: ValueType::String(increment.to_string().as_bytes().to_vec()),
+                            expire_at: None,
+                        },
+                    );
+                    RespValue::Integer(increment)
+                }
+            }
+        }
+
+        "DECRBY" => {
+            if array.len() != 3 {
+                return RespValue::Error("ERR wrong number of arguments for DECRBY".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let decrement = match &array[2] {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return RespValue::Error("ERR decrement is not an integer".to_string());
+                    }
+                },
+                _ => return RespValue::Error("ERR invalid decrement".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            match curr_db.get_mut(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            curr_db.insert(
+                                key,
+                                Value {
+                                    data: ValueType::String(
+                                        decrement.to_string().as_bytes().to_vec(),
+                                    ),
+                                    expire_at: None,
+                                },
+                            );
+                            return RespValue::Integer(decrement);
+                        }
+                    }
+
+                    match &mut v.data {
+                        ValueType::String(s) => {
+                            let num = String::from_utf8_lossy(s).parse::<i64>();
+                            match num {
+                                Ok(n) => {
+                                    let new_val = n - decrement;
+                                    *s = new_val.to_string().as_bytes().to_vec();
+                                    RespValue::Integer(new_val)
+                                }
+                                Err(_) => {
+                                    RespValue::Error("ERR value is not an integer".to_string())
+                                }
+                            }
+                        }
+                        _ => RespValue::Error("ERR value is not an integer".to_string()),
+                    }
+                }
+                None => {
+                    curr_db.insert(
+                        key,
+                        Value {
+                            data: ValueType::String(decrement.to_string().as_bytes().to_vec()),
+                            expire_at: None,
+                        },
+                    );
+                    RespValue::Integer(decrement)
+                }
+            }
+        }
+
+        "EXISTS" => {
+            if array.len() < 2 {
+                return RespValue::Error("ERR wrong number of arguments".to_string());
+            }
+            let current_db = _db.get_current();
+            let mut count = 0;
+            for item in &array[1..] {
+                let key = match item {
+                    RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                    RespValue::SimpleString(s) => s.clone(),
+                    _ => continue,
+                };
+                if current_db.contains_key(&key) {
+                    count += 1;
+                }
+            }
+            RespValue::Integer(count)
+        }
+
+        "TYPE" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for TYPE".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let current_db = _db.get_current();
+            current_db.get(&key).map_or_else(
+                || RespValue::Error("ERR no such key".to_string()),
+                |v| match &v.data {
+                    ValueType::String(_) => RespValue::SimpleString("string".to_string()),
+                    ValueType::Hash(_) => RespValue::SimpleString("hash".to_string()),
+                },
+            )
+        }
+
+        "DBSIZE" => {
+            let current_db = _db.get_current();
+            RespValue::Integer(current_db.len() as i64)
+        }
+
+        "FLUSHDB" => {
+            let mut current_db = _db.get_current();
+            current_db.clear();
+            RespValue::SimpleString("OK".to_string())
+        }
+
+        "RENAME" => {
+            if(array.len() != 3) {
+                return RespValue::Error("ERR wrong number of arguments for RENAME".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let new_key = match &array[2] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid new key".to_string()),
+            };
+            let mut current_db = _db.get_current();
+            if !current_db.contains_key(&key) {
+                return RespValue::Error("ERR no such key".to_string());
+            }
+            if current_db.contains_key(&new_key) {
+                return RespValue::Error("ERR new key already exists".to_string());
+            }
+            if let Some(value) = current_db.remove(&key) {
+                current_db.insert(new_key, value);
+            }
+            RespValue::SimpleString("OK".to_string())
+        }
+
+        "KEYS" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for KEYS".to_string());
+            }
+            let pattern = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid pattern".to_string()),
+            };
+            let current_db = _db.get_current();
+            let mut matching_keys = Vec::new();
+            for key in current_db.keys() {
+                if pattern == "*" || key.contains(&pattern.replace("*", "")) {
+                    matching_keys.push(RespValue::BulkString(Some(key.as_bytes().to_vec())));
+                }
+            }
+            RespValue::Array(Some(matching_keys))
+        }
+
+        "SELECT" => {
+            if(array.len() != 2) {
+                return RespValue::Error("ERR wrong number of arguments for SELECT".to_string());
+            }
+            let index = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid index".to_string()),
+            };
+            let index: usize = match index.parse() {
+                Ok(i) => i,
+                Err(_) => return RespValue::Error("ERR invalid index".to_string()),
+            };
+            if !_db.select_db(index) {
+                return RespValue::Error("ERR invalid index".to_string());
+            }
+            RespValue::SimpleString("OK".to_string())
         }
         _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
     }
