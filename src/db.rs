@@ -34,6 +34,15 @@ impl Database {
     pub fn get_current(&mut self) -> &mut HashMap<String, Value> {
         &mut self.dbs[self.current_db]
     }
+
+    pub fn select_db(&mut self, index: usize) -> bool {
+        if index < self.dbs.len() {
+            self.current_db = index;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 const RDB_MAGIC: &[u8] = b"MINIRDB001\n";

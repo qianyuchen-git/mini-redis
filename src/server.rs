@@ -889,7 +889,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
         }
 
         "RENAME" => {
-            if(array.len() != 3) {
+            if (array.len() != 3) {
                 return RespValue::Error("ERR wrong number of arguments for RENAME".to_string());
             }
             let key = match &array[1] {
@@ -935,7 +935,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
         }
 
         "SELECT" => {
-            if(array.len() != 2) {
+            if (array.len() != 2) {
                 return RespValue::Error("ERR wrong number of arguments for SELECT".to_string());
             }
             let index = match &array[1] {
@@ -951,6 +951,249 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 return RespValue::Error("ERR invalid index".to_string());
             }
             RespValue::SimpleString("OK".to_string())
+        }
+
+        "APPEND" => {
+            if (array.len() != 3) {
+                return RespValue::Error("ERR wrong number of arguments for APPEND".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let append_value = match &array[2] {
+                RespValue::BulkString(Some(v)) => v.clone(),
+                _ => return RespValue::Error("ERR invalid value".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            match curr_db.get_mut(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            curr_db.insert(
+                                key,
+                                Value {
+                                    data: ValueType::String(append_value.clone()),
+                                    expire_at: None,
+                                },
+                            );
+                            return RespValue::Integer(append_value.len() as i64);
+                        }
+                    }
+
+                    match &mut v.data {
+                        ValueType::String(s) => {
+                            s.extend_from_slice(&append_value);
+                            RespValue::Integer(s.len() as i64)
+                        }
+                        _ => RespValue::Error("ERR value is not a string".to_string()),
+                    }
+                }
+                None => {
+                    curr_db.insert(
+                        key,
+                        Value {
+                            data: ValueType::String(append_value.clone()),
+                            expire_at: None,
+                        },
+                    );
+                    RespValue::Integer(append_value.len() as i64)
+                }
+            }
+        }
+
+        "STRLEN" => {
+            if (array.len() != 2) {
+                return RespValue::Error("ERR wrong number of arguments for STRLEN".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            return RespValue::Integer(0);
+                        }
+                    }
+
+                    match &v.data {
+                        ValueType::String(s) => RespValue::Integer(s.len() as i64),
+                        _ => RespValue::Error("ERR value is not a string".to_string()),
+                    }
+                }
+                None => RespValue::Integer(0),
+            }
+        }
+
+        "HEXISTS" => {
+            if array.len() != 3 {
+                return RespValue::Error("ERR wrong number of arguments for HEXISTS".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let field = match &array[2] {
+                RespValue::BulkString(Some(v)) => String::from_utf8_lossy(v).to_string(),
+                _ => return RespValue::Error("ERR invalid field".to_string()),
+            };
+            let curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            return RespValue::Integer(0);
+                        }
+                    }
+
+                    match &v.data {
+                        ValueType::Hash(hashData) => {
+                            if hashData.contains_key(&field) {
+                                RespValue::Integer(1)
+                            } else {
+                                RespValue::Integer(0)
+                            }
+                        }
+                        _ => RespValue::Error("ERR value is not a hash".to_string()),
+                    }
+                }
+                None => RespValue::Integer(0),
+            }
+        }
+
+        "HLEN" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for HLEN".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            return RespValue::Integer(0);
+                        }
+                    }
+
+                    match &v.data {
+                        ValueType::Hash(hashData) => RespValue::Integer(hashData.len() as i64),
+                        _ => RespValue::Error("ERR value is not a hash".to_string()),
+                    }
+                }
+                None => RespValue::Integer(0),
+            }
+        }
+
+        "HKEYS" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for HKEYS".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            return RespValue::Array(Some(vec![]));
+                        }
+                    }
+
+                    match &v.data {
+                        ValueType::Hash(hashData) => {
+                            let keys: Vec<RespValue> = hashData
+                                .keys()
+                                .map(|k| RespValue::BulkString(Some(k.as_bytes().to_vec())))
+                                .collect();
+                            RespValue::Array(Some(keys))
+                        }
+                        _ => RespValue::Error("ERR value is not a hash".to_string()),
+                    }
+                }
+                None => RespValue::Array(Some(vec![])),
+            }
+        }
+
+        "HVALS" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for HVALS".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+
+                    if let Some(expire) = v.expire_at {
+                        if now >= expire {
+                            curr_db.remove(&key); // 惰性删除
+                            return RespValue::Array(Some(vec![]));
+                        }
+                    }
+
+                    match &v.data {
+                        ValueType::Hash(hashData) => {
+                            let values: Vec<RespValue> = hashData
+                                .values()
+                                .map(|v| RespValue::BulkString(Some(v.clone())))
+                                .collect();
+                            RespValue::Array(Some(values))
+                        }
+                        _ => RespValue::Error("ERR value is not a hash".to_string()),
+                    }
+                }
+                None => RespValue::Array(Some(vec![])),
+            }
         }
         _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
     }
