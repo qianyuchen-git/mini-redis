@@ -5,6 +5,7 @@ use crate::queue::CommandQueue;
 use crate::resp::{self, RespEncoder, RespParser, RespValue};
 use std::collections::HashMap;
 use std::io;
+use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -873,6 +874,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 |v| match &v.data {
                     ValueType::String(_) => RespValue::SimpleString("string".to_string()),
                     ValueType::Hash(_) => RespValue::SimpleString("hash".to_string()),
+                    ValueType::List(_) => RespValue::SimpleString("list".to_string()),
                 },
             )
         }
@@ -1195,6 +1197,243 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 None => RespValue::Array(Some(vec![])),
             }
         }
+
+        "LPUSH" | "RPUSH" => {
+            if array.len() < 3 {
+                return RespValue::Error(format!(
+                    "ERR wrong number of arguments for {}",
+                    cmd_name
+                ));
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            let list = match curr_db.get_mut(&key) {
+                Some(v) => match &mut v.data {
+                    ValueType::List(l) => l,
+                    ValueType::String(_) | ValueType::Hash(_) => {
+                        return RespValue::Error("ERR value is not a list".to_string())
+                    }
+                },
+                None => {
+                    curr_db.insert(
+                        key.clone(),
+                        Value {
+                            data: ValueType::List(VecDeque::new()),
+                            expire_at: None,
+                        },
+                    );
+                    match curr_db.get_mut(&key) {
+                        Some(v) => match &mut v.data {
+                            ValueType::List(l) => l,
+                            _ => unreachable!(),
+                        },
+                        None => unreachable!(),
+                    }
+                }
+            };
+            for item in &array[2..] {
+                let value = match item {
+                    RespValue::BulkString(Some(v)) => v.clone(),
+                    _ => return RespValue::Error("ERR invalid value".to_string()),
+                };
+                if cmd_name == "LPUSH" {
+                    list.push_front(value);
+                } else {
+                    list.push_back(value);
+                }
+            }
+            RespValue::Integer(list.len() as i64)
+        }
+
+        "LPOP" | "RPOP" => {
+            if array.len() != 2 {
+                return RespValue::Error(format!(
+                    "ERR wrong number of arguments for {}",
+                    cmd_name
+                ));
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            match curr_db.get_mut(&key) {
+                Some(v) => match &mut v.data {
+                    ValueType::List(l) => {
+                        let result = if cmd_name == "LPOP" {
+                            l.pop_front()
+                        } else {
+                            l.pop_back()
+                        };
+                        match result {
+                            Some(item) => RespValue::BulkString(Some(item)),
+                            None => RespValue::SimpleString("None".to_string()),
+                        }
+                    }
+                    ValueType::String(_) | ValueType::Hash(_) => {
+                        return RespValue::Error("ERR value is not a list".to_string())
+                    }
+                },
+                None => RespValue::SimpleString("None".to_string()),
+            }
+        }
+
+        "LLEN" => {
+            if array.len() != 2 {
+                return RespValue::Error("ERR wrong number of arguments for LLEN".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => match &v.data {
+                    ValueType::List(l) => RespValue::Integer(l.len() as i64),
+                    ValueType::String(_) | ValueType::Hash(_) => {
+                        return RespValue::Error("ERR value is not a list".to_string())
+                    }
+                },
+                None => RespValue::Integer(0),
+            }
+        }
+
+        "LRANGE" => {
+            if array.len() != 4 {
+                return RespValue::Error("ERR wrong number of arguments for LRANGE".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let start = match &array[2] {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>() {
+                    Ok(n) => n,
+                    Err(_) => return RespValue::Error("ERR invalid start index".to_string()),
+                },
+                _ => return RespValue::Error("ERR invalid start index".to_string()),
+            };
+            let stop = match &array[3] {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>() {
+                    Ok(n) => n,
+                    Err(_) => return RespValue::Error("ERR invalid stop index".to_string()),
+                },
+                _ => return RespValue::Error("ERR invalid stop index".to_string()),
+            };
+            let curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => match &v.data {
+                    ValueType::List(l) => {
+                        let len = l.len() as isize;
+                        let start_idx = if start < 0 { len + start } else { start };
+                        let stop_idx = if stop < 0 { len + stop } else { stop };
+                        if start_idx >= len || stop_idx < 0 || start_idx > stop_idx {
+                            return RespValue::Array(Some(vec![]));
+                        }
+                        let result: Vec<RespValue> = l
+                            .iter()
+                            .skip(start_idx as usize)
+                            .take((stop_idx - start_idx + 1) as usize)
+                            .map(|item| RespValue::BulkString(Some(item.clone())))
+                            .collect();
+                        RespValue::Array(Some(result))
+                    }
+                    ValueType::String(_) | ValueType::Hash(_) => {
+                        return RespValue::Error("ERR value is not a list".to_string())
+                    }
+                },
+                None => RespValue::Array(Some(vec![])),
+            }
+        }
+
+        "LINDEX" => {
+            if array.len() != 3 {
+                return RespValue::Error("ERR wrong number of arguments for LINDEX".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let index = match &array[2] {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>() {
+                    Ok(n) => n,
+                    Err(_) => return RespValue::Error("ERR invalid index".to_string()),
+                },
+                _ => return RespValue::Error("ERR invalid index".to_string()),
+            };
+            let curr_db = _db.get_current();
+            match curr_db.get(&key) {
+                Some(v) => match &v.data {
+                    ValueType::List(l) => {
+                        let len = l.len() as isize;
+                        let idx = if index < 0 { len + index } else { index };
+                        if idx < 0 || idx >= len {
+                            return RespValue::SimpleString("NONE".to_string());
+                        }
+                        match l.get(idx as usize) {
+                            Some(item) => RespValue::BulkString(Some(item.clone())),
+                            None => RespValue::SimpleString("NONE".to_string()),
+                        }
+                    }
+                    ValueType::String(_) | ValueType::Hash(_) => {
+                        return RespValue::Error("ERR value is not a list".to_string())
+                    }
+                },
+                None =>  RespValue::SimpleString("NONE".to_string()),
+            }
+        }
+
+        "LSET" => {
+            if array.len() != 4 {
+                return RespValue::Error("ERR wrong number of arguments for LSET".to_string());
+            }
+            let key = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid key".to_string()),
+            };
+            let index = match &array[2] {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>() {
+                    Ok(n) => n,
+                    Err(_) => return RespValue::Error("ERR invalid index".to_string()),
+                },
+                _ => return RespValue::Error("ERR invalid index".to_string()),
+            };
+            let new_value = match &array[3] {
+                RespValue::BulkString(Some(v)) => v.clone(),
+                _ => return RespValue::Error("ERR invalid value".to_string()),
+            };
+            let mut curr_db = _db.get_current();
+            match curr_db.get_mut(&key) {
+                Some(v) => match &mut v.data {
+                    ValueType::List(l) => {
+                        let len = l.len() as isize;
+                        let idx = if index < 0 { len + index } else { index };
+                        if idx < 0 || idx >= len {
+                            return RespValue::Error("ERR index out of range".to_string());
+                        }
+                        if let Some(item) = l.get_mut(idx as usize) {
+                            *item = new_value;
+                            RespValue::SimpleString("OK".to_string())
+                        } else {
+                            RespValue::Error("ERR index out of range".to_string())
+                        }
+                    }
+                    ValueType::String(_) | ValueType::Hash(_) => {
+                        return RespValue::Error("ERR value is not a list".to_string())
+                    }
+                },
+                None => RespValue::Error("ERR no such key".to_string()),
+            }
+        }       
         _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
     }
 }
