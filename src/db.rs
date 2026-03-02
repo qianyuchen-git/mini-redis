@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::iter::Filter;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum ValueType {
     String(Vec<u8>),
     Hash(HashMap<String, Vec<u8>>),
+    List(VecDeque<Vec<u8>>),
 }
 #[derive(Debug, Clone)]
 pub struct Value {
@@ -73,6 +75,7 @@ pub fn save_rdb(db: &mut Database, path: &str) -> io::Result<()> {
             let type_byte = match &value.data {
                 ValueType::String(_) => 0u8,
                 ValueType::Hash(_) => 1u8,
+                ValueType::List(_) => 2u8,
             };
             file.write_all(&[type_byte])?;
             if let Some(expire) = value.expire_at {
@@ -97,6 +100,14 @@ pub fn save_rdb(db: &mut Database, path: &str) -> io::Result<()> {
 
                         file.write_all(&(v.len() as u32).to_le_bytes())?;
                         file.write_all(v)?;
+                    }
+                }
+                ValueType::List(list) => {
+                    let item_count = list.len() as u32;
+                    file.write_all(&item_count.to_le_bytes())?;
+                    for item in list {
+                        file.write_all(&(item.len() as u32).to_le_bytes())?;
+                        file.write_all(item)?;
                     }
                 }
             }
