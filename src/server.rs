@@ -1,11 +1,13 @@
 // server.rs
 
 use crate::db::{Database, Value, ValueType, load_rdb, save_rdb};
+use crate::pubsub;
+use crate::pubsub::PubSub;
 use crate::queue::CommandQueue;
 use crate::resp::{self, RespEncoder, RespParser, RespValue};
 use std::collections::HashMap;
-use std::io;
 use std::collections::VecDeque;
+use std::io;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,7 +23,7 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
     type Cmd = (RespValue, oneshot::Sender<RespValue>);
 
     let (tx_cmd, mut rx_cmd) = mpsc::channel::<Cmd>(1024);
-
+    let pubsub = Arc::new(Mutex::new(PubSub::new()));
     println!("Mini-Redis listening on {}", addr);
     let mut db = Database::new();
     load_rdb(&mut db, "dump.rdb").ok();
@@ -45,9 +47,98 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
         let tx_cmd_clone = tx_cmd.clone();
         tokio::spawn(async move {
             let mut parser = RespParser::new();
+            let mut message_type = "Normal".to_string();
             loop {
                 if let Some(command) = parser.read_value(&mut socket).await.unwrap() {
                     println!("Received command: {:?}", command);
+                    let temp_command = &command;
+                    match temp_command {
+                        RespValue::Array(Some(arr)) => {
+                            if (arr.len() == 2) {
+                                let cmd_name = match &arr[0] {
+                                    RespValue::BulkString(Some(bytes)) => {
+                                        String::from_utf8_lossy(bytes).to_ascii_uppercase()
+                                    }
+                                    RespValue::SimpleString(s) => s.to_ascii_uppercase(),
+                                    _ => "UNKNOWN".to_string(),
+                                };
+                                let cmd_arg = match &arr[1] {
+                                    RespValue::BulkString(Some(bytes)) => {
+                                        String::from_utf8_lossy(bytes).to_string()
+                                    }
+                                    RespValue::SimpleString(s) => s.clone(),
+                                    _ => "UNKNOWN".to_string(),
+                                };
+                                if (cmd_name == "SUBSCRIBLE") {
+                                    message_type = "PubSub".to_string();
+                                    println!("SUBSCRIBLE CHANNEL: {}", cmd_arg);
+                                    let mut receiver=
+                                    {
+                                        let mut pubsub = pubsub.lock().unwrap();
+                                        pubsub.subscribe(&cmd_arg)
+                                    };
+                                    tokio::spawn(async {
+                                        while let Ok(message) = receiver.recv().await {
+                                            let response = RespValue::Array(Some(vec![
+                                                RespValue::BulkString(Some(b"message".to_vec())),
+                                                RespValue::BulkString(Some(
+                                                    cmd_arg.as_bytes().to_vec(),
+                                                )),
+                                                RespValue::BulkString(Some(
+                                                    message.as_bytes().to_vec(),
+                                                )),
+                                            ]));
+                                            let resp_bytes = RespEncoder::encode_resp(&response);
+                                            socket.write_all(&resp_bytes).await.unwrap();
+                                            socket.flush().await.unwrap();
+                                        }
+                                    });
+                                    socket
+                                        .write_all(
+                                            RespEncoder::encode_resp(&RespValue::SimpleString(
+                                                "OK".to_string(),
+                                            ))
+                                            .as_slice(),
+                                        )
+                                        .await
+                                        .unwrap();
+                                    socket.flush().await.unwrap();
+                                }
+                                if (cmd_name == "UNSUBSCRIBLE") {
+                                    message_type = "Normal".to_string();
+                                    println!("UNSUBSCRIBLE CHANNEL: {}", cmd_arg);
+                                    {
+                                        let mut pubsub = pubsub.lock().unwrap();
+                                        pubsub.unsubscribe(&cmd_arg);
+                                    }
+                                    socket
+                                        .write_all(
+                                            RespEncoder::encode_resp(&RespValue::SimpleString(
+                                                "OK".to_string(),
+                                            ))
+                                            .as_slice(),
+                                        )
+                                        .await
+                                        .unwrap();
+                                    socket.flush().await.unwrap();
+                                }
+                            }
+                        }
+                        _ => {}
+                    };
+                    if message_type == "PubSub" {
+                        socket
+                            .write_all(
+                                RespEncoder::encode_resp(&&RespValue::Error(
+                                    "the client is in PubSub mode".to_string(),
+                                ))
+                                .as_slice(),
+                            )
+                            .await
+                            .unwrap();
+                        socket.flush().await.unwrap();
+                        continue;
+                    }
                     let (resp_tx, mut resp_rx) = oneshot::channel();
                     tx_cmd_clone.send((command, resp_tx)).await.unwrap();
                     if let Ok(response) = resp_rx.await {
@@ -1200,10 +1291,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
 
         "LPUSH" | "RPUSH" => {
             if array.len() < 3 {
-                return RespValue::Error(format!(
-                    "ERR wrong number of arguments for {}",
-                    cmd_name
-                ));
+                return RespValue::Error(format!("ERR wrong number of arguments for {}", cmd_name));
             }
             let key = match &array[1] {
                 RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
@@ -1215,7 +1303,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 Some(v) => match &mut v.data {
                     ValueType::List(l) => l,
                     ValueType::String(_) | ValueType::Hash(_) => {
-                        return RespValue::Error("ERR value is not a list".to_string())
+                        return RespValue::Error("ERR value is not a list".to_string());
                     }
                 },
                 None => {
@@ -1251,10 +1339,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
 
         "LPOP" | "RPOP" => {
             if array.len() != 2 {
-                return RespValue::Error(format!(
-                    "ERR wrong number of arguments for {}",
-                    cmd_name
-                ));
+                return RespValue::Error(format!("ERR wrong number of arguments for {}", cmd_name));
             }
             let key = match &array[1] {
                 RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
@@ -1276,7 +1361,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                         }
                     }
                     ValueType::String(_) | ValueType::Hash(_) => {
-                        return RespValue::Error("ERR value is not a list".to_string())
+                        return RespValue::Error("ERR value is not a list".to_string());
                     }
                 },
                 None => RespValue::SimpleString("None".to_string()),
@@ -1297,7 +1382,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 Some(v) => match &v.data {
                     ValueType::List(l) => RespValue::Integer(l.len() as i64),
                     ValueType::String(_) | ValueType::Hash(_) => {
-                        return RespValue::Error("ERR value is not a list".to_string())
+                        return RespValue::Error("ERR value is not a list".to_string());
                     }
                 },
                 None => RespValue::Integer(0),
@@ -1314,14 +1399,16 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 _ => return RespValue::Error("ERR invalid key".to_string()),
             };
             let start = match &array[2] {
-                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>() {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>()
+                {
                     Ok(n) => n,
                     Err(_) => return RespValue::Error("ERR invalid start index".to_string()),
                 },
                 _ => return RespValue::Error("ERR invalid start index".to_string()),
             };
             let stop = match &array[3] {
-                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>() {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>()
+                {
                     Ok(n) => n,
                     Err(_) => return RespValue::Error("ERR invalid stop index".to_string()),
                 },
@@ -1346,7 +1433,7 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                         RespValue::Array(Some(result))
                     }
                     ValueType::String(_) | ValueType::Hash(_) => {
-                        return RespValue::Error("ERR value is not a list".to_string())
+                        return RespValue::Error("ERR value is not a list".to_string());
                     }
                 },
                 None => RespValue::Array(Some(vec![])),
@@ -1363,7 +1450,8 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 _ => return RespValue::Error("ERR invalid key".to_string()),
             };
             let index = match &array[2] {
-                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>() {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>()
+                {
                     Ok(n) => n,
                     Err(_) => return RespValue::Error("ERR invalid index".to_string()),
                 },
@@ -1384,10 +1472,10 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                         }
                     }
                     ValueType::String(_) | ValueType::Hash(_) => {
-                        return RespValue::Error("ERR value is not a list".to_string())
+                        return RespValue::Error("ERR value is not a list".to_string());
                     }
                 },
-                None =>  RespValue::SimpleString("NONE".to_string()),
+                None => RespValue::SimpleString("NONE".to_string()),
             }
         }
 
@@ -1401,7 +1489,8 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 _ => return RespValue::Error("ERR invalid key".to_string()),
             };
             let index = match &array[2] {
-                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>() {
+                RespValue::BulkString(Some(v)) => match String::from_utf8_lossy(v).parse::<isize>()
+                {
                     Ok(n) => n,
                     Err(_) => return RespValue::Error("ERR invalid index".to_string()),
                 },
@@ -1428,12 +1517,12 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                         }
                     }
                     ValueType::String(_) | ValueType::Hash(_) => {
-                        return RespValue::Error("ERR value is not a list".to_string())
+                        return RespValue::Error("ERR value is not a list".to_string());
                     }
                 },
                 None => RespValue::Error("ERR no such key".to_string()),
             }
-        }       
+        }
         _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
     }
 }
