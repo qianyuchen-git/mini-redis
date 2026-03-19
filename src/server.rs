@@ -5,6 +5,7 @@ use crate::pubsub;
 use crate::pubsub::PubSub;
 use crate::queue::CommandQueue;
 use crate::resp::{self, RespEncoder, RespParser, RespValue};
+use core::error;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
@@ -13,7 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::StreamExt;
+use tokio_stream::StreamMap;
+use tokio_stream::wrappers::BroadcastStream;
 
 const MAX_BUFFER_SIZE: usize = 512 * 1024 * 1024; // 512MB 防 DoS
 
@@ -27,13 +32,15 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
     println!("Mini-Redis listening on {}", addr);
     let mut db = Database::new();
     load_rdb(&mut db, "dump.rdb").ok();
+    let clone_pubsub = Arc::clone(&pubsub);
     tokio::spawn(async move {
         loop {
             if rx_cmd.capacity() == 0 {
                 break;
             }
             if let Some((command, resp_tx)) = rx_cmd.recv().await {
-                let response = execute_command(&command, &mut db);
+                let response =
+                    execute_command(&command, &mut db, &mut clone_pubsub.lock().unwrap());
                 resp_tx.send(response).unwrap();
             } else {
                 break;
@@ -42,120 +49,285 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
     });
     loop {
         let (mut socket, peer_addr) = listener.accept().await?;
+        let tx_clone = tx_cmd.clone();
+        let pubsub_clone = Arc::clone(&pubsub);
         println!("New connection from {}", peer_addr);
-
-        let tx_cmd_clone = tx_cmd.clone();
         tokio::spawn(async move {
-            let mut parser = RespParser::new();
-            let mut message_type = "Normal".to_string();
+            let mut parse = RespParser::new();
+            let mut stream_map = StreamMap::new();
             loop {
-                if let Some(command) = parser.read_value(&mut socket).await.unwrap() {
-                    println!("Received command: {:?}", command);
-                    let temp_command = &command;
-                    match temp_command {
-                        RespValue::Array(Some(arr)) => {
-                            if (arr.len() == 2) {
-                                let cmd_name = match &arr[0] {
-                                    RespValue::BulkString(Some(bytes)) => {
-                                        String::from_utf8_lossy(bytes).to_ascii_uppercase()
-                                    }
-                                    RespValue::SimpleString(s) => s.to_ascii_uppercase(),
-                                    _ => "UNKNOWN".to_string(),
-                                };
-                                let cmd_arg = match &arr[1] {
-                                    RespValue::BulkString(Some(bytes)) => {
-                                        String::from_utf8_lossy(bytes).to_string()
-                                    }
-                                    RespValue::SimpleString(s) => s.clone(),
-                                    _ => "UNKNOWN".to_string(),
-                                };
-                                if (cmd_name == "SUBSCRIBLE") {
-                                    message_type = "PubSub".to_string();
-                                    println!("SUBSCRIBLE CHANNEL: {}", cmd_arg);
-                                    let mut receiver=
-                                    {
-                                        let mut pubsub = pubsub.lock().unwrap();
-                                        pubsub.subscribe(&cmd_arg)
+                if !stream_map.is_empty() {
+                    tokio::select! {
+                        result = parse.read_value(&mut socket)=> {
+                            match result {
+                                 Ok(Some(resp_value))=> {
+                                match &resp_value {
+                                RespValue::Array(Some(arr)) => {
+                                    let cmd_name = match arr.first() {
+                                        Some(RespValue::BulkString(Some(bytes))) => {
+                                            String::from_utf8_lossy(bytes).to_ascii_uppercase()
+                                        }
+                                        Some(RespValue::SimpleString(s)) => s.to_ascii_uppercase(),
+                                        _ => {
+                                            let error_response = RespValue::Error("ERR invalid command name".to_string());
+                                            let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                            socket.write_all(&resp_bytes).await.unwrap();
+                                            socket.flush().await.unwrap();
+                                            continue;
+                                        },
                                     };
-                                    tokio::spawn(async {
-                                        while let Ok(message) = receiver.recv().await {
+                                    if(cmd_name == "SUBSCRIBE"){
+                                        if arr.len() < 2 {
+                                            let error_response = RespValue::Error("ERR wrong number of arguments for SUBSCRIBE".to_string());
+                                            let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                            socket.write_all(&resp_bytes).await.unwrap();
+                                            socket.flush().await.unwrap();
+                                            continue;
+                                        }
+                                        for item in &arr[1..]{
+                                            let channel = match item {
+                                                RespValue::BulkString(Some(bytes)) => String::from_utf8_lossy(bytes).to_string(),
+                                                RespValue::SimpleString(s) => s.clone(),
+                                                _ => {
+                                                    let error_response = RespValue::Error("ERR invalid channel name".to_string());
+                                                    let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                                    socket.write_all(&resp_bytes).await.unwrap();
+                                                    socket.flush().await.unwrap();
+                                                    continue;
+                                                },
+                                            };
+                                            let receiver = {
+                                                let mut pubsub = pubsub_clone.lock().unwrap();
+                                                pubsub.subscribe(&channel)
+                                            };
+                                            stream_map.insert(channel.clone(), BroadcastStream::new(receiver));
                                             let response = RespValue::Array(Some(vec![
-                                                RespValue::BulkString(Some(b"message".to_vec())),
-                                                RespValue::BulkString(Some(
-                                                    cmd_arg.as_bytes().to_vec(),
-                                                )),
-                                                RespValue::BulkString(Some(
-                                                    message.as_bytes().to_vec(),
-                                                )),
+                                                RespValue::BulkString(Some(b"subscribe".to_vec())),
+                                                RespValue::BulkString(Some(channel.as_bytes().to_vec())),
+                                                RespValue::Integer(stream_map.len() as i64),
                                             ]));
                                             let resp_bytes = RespEncoder::encode_resp(&response);
                                             socket.write_all(&resp_bytes).await.unwrap();
                                             socket.flush().await.unwrap();
                                         }
-                                    });
-                                    socket
-                                        .write_all(
-                                            RespEncoder::encode_resp(&RespValue::SimpleString(
-                                                "OK".to_string(),
-                                            ))
-                                            .as_slice(),
-                                        )
-                                        .await
-                                        .unwrap();
+
+                                    }
+                                    else if(cmd_name == "UNSUBSCRIBE") {
+                                        if arr.len() < 2 {
+                                            for item in stream_map.keys() {
+                                                let mut pubsub = pubsub_clone.lock().unwrap();
+                                                pubsub.unsubscribe(item);
+                                            }
+                                            stream_map.clear();
+                                            let response = RespValue::Array(Some(vec![
+                                                RespValue::BulkString(Some(b"unsubscribe".to_vec())),
+                                                RespValue::BulkString(None),
+                                                RespValue::Integer(0),
+                                            ]));
+                                            let resp_bytes = RespEncoder::encode_resp(&response);
+                                            socket.write_all(&resp_bytes).await.unwrap();
+                                            socket.flush().await.unwrap();
+                                            continue;
+                                        }
+                                        for item in &arr[1..]{
+                                            let channel = match item {
+                                                RespValue::BulkString(Some(bytes)) => String::from_utf8_lossy(bytes).to_string(),
+                                                RespValue::SimpleString(s) => s.clone(),
+                                                _ => {
+                                                    let error_response = RespValue::Error("ERR invalid channel name".to_string());
+                                                    let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                                    socket.write_all(&resp_bytes).await.unwrap();
+                                                    socket.flush().await.unwrap();
+                                                    continue;
+                                                },
+                                            };
+                                            {
+                                                let mut pubsub = pubsub_clone.lock().unwrap();
+                                                pubsub.unsubscribe(&channel);
+                                            }
+                                            stream_map.remove(&channel);
+                                            let response = RespValue::Array(Some(vec![
+                                                RespValue::BulkString(Some(b"unsubscribe".to_vec())),
+                                                RespValue::BulkString(Some(channel.as_bytes().to_vec())),
+                                                RespValue::Integer(stream_map.len() as i64),
+                                            ]));
+                                            let resp_bytes = RespEncoder::encode_resp(&response);
+                                            socket.write_all(&resp_bytes).await.unwrap();
+                                            socket.flush().await.unwrap();
+                                        }
+
+                                    }
+                                    else if cmd_name == "PING" || cmd_name == "ECHO" {
+                                        let (resp_tx, resp_rx) = oneshot::channel();
+                                        tx_clone.send((resp_value.clone(), resp_tx)).await.unwrap();
+                                        if let Ok(response) = resp_rx.await {
+                                            let resp_bytes = RespEncoder::encode_resp(&response);
+                                            socket.write_all(&resp_bytes).await.unwrap();
+                                            socket.flush().await.unwrap();
+                                        }
+                                    }
+                                    else {
+                                        // subscribe mode can't execute other commands, only subscribe and unsubscribe
+                                        let error_response = RespValue::Error("ERR only SUBSCRIBE and UNSUBSCRIBE commands are allowed in subscribe mode".to_string());
+                                        let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                        socket.write_all(&resp_bytes).await.unwrap();
+                                        socket.flush().await.unwrap();
+                                    }
+                                }
+                                _ => {
+                                    let error_response = RespValue::Error("ERR invalid command format".to_string());
+                                    let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                    socket.write_all(&resp_bytes).await.unwrap();
                                     socket.flush().await.unwrap();
                                 }
-                                if (cmd_name == "UNSUBSCRIBLE") {
-                                    message_type = "Normal".to_string();
-                                    println!("UNSUBSCRIBLE CHANNEL: {}", cmd_arg);
-                                    {
-                                        let mut pubsub = pubsub.lock().unwrap();
-                                        pubsub.unsubscribe(&cmd_arg);
+                            }}
+                            Ok(None) => {
+                                    // 客户端断开连接
+                                    println!("Client {} disconnected (subscribe mode)", peer_addr);
+                                    // 清理所有订阅
+                                    let channels: Vec<String> = stream_map.keys().cloned().collect();
+                                    let mut pubsub = pubsub_clone.lock().unwrap();
+                                    for channel in &channels {
+                                        pubsub.unsubscribe(channel);
                                     }
-                                    socket
-                                        .write_all(
-                                            RespEncoder::encode_resp(&RespValue::SimpleString(
-                                                "OK".to_string(),
-                                            ))
-                                            .as_slice(),
-                                        )
-                                        .await
-                                        .unwrap();
-                                    socket.flush().await.unwrap();
+                                    return;  // 退出整个 Task
+                                }
+                                Err(e) => {
+                                    eprintln!("Parse error from {} in subscribe mode: {}", peer_addr, e);
+                                    // 清理所有订阅
+                                    let channels: Vec<String> = stream_map.keys().cloned().collect();
+                                    let mut pubsub = pubsub_clone.lock().unwrap();
+                                    for channel in &channels {
+                                        pubsub.unsubscribe(channel);
+                                    }
+                                    return;  // 退出整个 Task
                                 }
                             }
                         }
-                        _ => {}
-                    };
-                    if message_type == "PubSub" {
-                        socket
-                            .write_all(
-                                RespEncoder::encode_resp(&&RespValue::Error(
-                                    "the client is in PubSub mode".to_string(),
-                                ))
-                                .as_slice(),
-                            )
-                            .await
-                            .unwrap();
-                        socket.flush().await.unwrap();
-                        continue;
-                    }
-                    let (resp_tx, mut resp_rx) = oneshot::channel();
-                    tx_cmd_clone.send((command, resp_tx)).await.unwrap();
-                    if let Ok(response) = resp_rx.await {
-                        let resp_bytes = RespEncoder::encode_resp(&response);
-                        socket.write_all(&resp_bytes).await.unwrap();
-                        socket.flush().await.unwrap();
+
+                        Some((channel, msg)) = stream_map.next() => {
+                            let message = match msg {
+                                Ok(m) => m,
+                                Err(_) => continue, // 订阅者已断开，继续监听其他消息
+                            };
+                            let response = RespValue::Array(Some(vec![
+                                RespValue::BulkString(Some(b"message".to_vec())),
+                                RespValue::BulkString(Some(channel.as_bytes().to_vec())),
+                                RespValue::BulkString(Some(message.as_bytes().to_vec())),
+                            ]));
+                            let resp_bytes = RespEncoder::encode_resp(&response);
+                            socket.write_all(&resp_bytes).await.unwrap();
+                            socket.flush().await.unwrap();
+                        }
+                         else => {
+                            break;
+                         }
                     }
                 } else {
-                    print!("Client disconnected\n");
-                    return;
+                    if let Ok(Some(resp_value)) = parse.read_value(&mut socket).await {
+                        match &resp_value {
+                            RespValue::Array(Some(arr)) => {
+                                let cmd_name = match arr.first() {
+                                    Some(RespValue::BulkString(Some(bytes))) => {
+                                        String::from_utf8_lossy(bytes).to_ascii_uppercase()
+                                    }
+                                    Some(RespValue::SimpleString(s)) => s.to_ascii_uppercase(),
+                                    _ => {
+                                        let error_response = RespValue::Error(
+                                            "ERR invalid command name".to_string(),
+                                        );
+                                        let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                        socket.write_all(&resp_bytes).await.unwrap();
+                                        socket.flush().await.unwrap();
+                                        continue;
+                                    }
+                                };
+                                if cmd_name == "SUBSCRIBE" {
+                                    if arr.len() < 2 {
+                                        let error_response = RespValue::Error(
+                                            "ERR wrong number of arguments for SUBSCRIBE"
+                                                .to_string(),
+                                        );
+                                        let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                        socket.write_all(&resp_bytes).await.unwrap();
+                                        socket.flush().await.unwrap();
+                                        continue;
+                                    }
+                                    for item in &arr[1..] {
+                                        let channel = match item {
+                                            RespValue::BulkString(Some(bytes)) => {
+                                                String::from_utf8_lossy(bytes).to_string()
+                                            }
+                                            RespValue::SimpleString(s) => s.clone(),
+                                            _ => {
+                                                let error_response = RespValue::Error(
+                                                    "ERR invalid channel name".to_string(),
+                                                );
+                                                let resp_bytes =
+                                                    RespEncoder::encode_resp(&error_response);
+                                                socket.write_all(&resp_bytes).await.unwrap();
+                                                socket.flush().await.unwrap();
+                                                continue;
+                                            }
+                                        };
+                                        let receiver = {
+                                            let mut pubsub = pubsub_clone.lock().unwrap();
+                                            pubsub.subscribe(&channel)
+                                        };
+                                        stream_map.insert(
+                                            channel.clone(),
+                                            BroadcastStream::new(receiver),
+                                        );
+                                        let response = RespValue::Array(Some(vec![
+                                            RespValue::BulkString(Some(b"subscribe".to_vec())),
+                                            RespValue::BulkString(Some(
+                                                channel.as_bytes().to_vec(),
+                                            )),
+                                            RespValue::Integer(stream_map.len() as i64),
+                                        ]));
+                                        let resp_bytes = RespEncoder::encode_resp(&response);
+                                        socket.write_all(&resp_bytes).await.unwrap();
+                                        socket.flush().await.unwrap();
+                                    }
+                                } else if cmd_name == "UNSUBSCRIBE" {
+                                    // normal mode only return 0 when command is unsubscribe
+                                    let response = RespValue::Array(Some(vec![
+                                        RespValue::BulkString(Some(b"unsubscribe".to_vec())),
+                                        RespValue::BulkString(None),
+                                        RespValue::Integer(0),
+                                    ]));
+                                    let resp_bytes = RespEncoder::encode_resp(&response);
+                                    socket.write_all(&resp_bytes).await.unwrap();
+                                    socket.flush().await.unwrap();
+                                } else {
+                                    let (resp_tx, resp_rx) = oneshot::channel();
+                                    tx_clone.send((resp_value.clone(), resp_tx)).await.unwrap();
+                                    if let Ok(response) = resp_rx.await {
+                                        let resp_bytes = RespEncoder::encode_resp(&response);
+                                        socket.write_all(&resp_bytes).await.unwrap();
+                                        socket.flush().await.unwrap();
+                                    }
+                                }
+                            }
+                            _ => {
+                                let error_response =
+                                    RespValue::Error("ERR invalid command format".to_string());
+                                let resp_bytes = RespEncoder::encode_resp(&error_response);
+                                socket.write_all(&resp_bytes).await.unwrap();
+                                socket.flush().await.unwrap();
+                            }
+                        }
+                    } else {
+                        println!("Client {} disconnected", peer_addr);
+                        break;
+                    }
                 }
             }
         });
     }
 }
 
-fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
+fn execute_command(command: &RespValue, _db: &mut Database, pubsub: &mut PubSub) -> RespValue {
     // 命令必须是 Array
     let array = match command {
         RespValue::Array(Some(arr)) => arr,
@@ -1522,6 +1694,23 @@ fn execute_command(command: &RespValue, _db: &mut Database) -> RespValue {
                 },
                 None => RespValue::Error("ERR no such key".to_string()),
             }
+        }
+
+        "PUBLISH" => {
+            if array.len() != 3 {
+                return RespValue::Error("ERR wrong number of arguments for PUBLISH".to_string());
+            }
+            let topic = match &array[1] {
+                RespValue::BulkString(Some(bs)) => String::from_utf8_lossy(bs).to_string(),
+                RespValue::SimpleString(s) => s.clone(),
+                _ => return RespValue::Error("ERR invalid topic".to_string()),
+            };
+            let message = match &array[2] {
+                RespValue::BulkString(Some(v)) => String::from_utf8_lossy(v).to_string(),
+                _ => return RespValue::Error("ERR invalid message".to_string()),
+            };
+            let subscribers = pubsub.publish(&topic, &message);
+            RespValue::Integer(subscribers as i64)
         }
         _ => RespValue::Error(format!("ERR unknown command '{}'", cmd_name)),
     }
