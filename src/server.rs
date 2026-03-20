@@ -63,25 +63,18 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                  Ok(Some(resp_value))=> {
                                 match &resp_value {
                                 RespValue::Array(Some(arr)) => {
-                                    let cmd_name = match arr.first() {
-                                        Some(RespValue::BulkString(Some(bytes))) => {
-                                            String::from_utf8_lossy(bytes).to_ascii_uppercase()
-                                        }
-                                        Some(RespValue::SimpleString(s)) => s.to_ascii_uppercase(),
-                                        _ => {
-                                            let error_response = RespValue::Error("ERR invalid command name".to_string());
-                                            let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                            socket.write_all(&resp_bytes).await.unwrap();
-                                            socket.flush().await.unwrap();
+                                    let cmd_name = match parse_cmd_name(arr) {
+                                        Ok(name) => name,
+                                        Err(e) => {
+                                            let error_response = RespValue::Error(e);
+                                            write_response(&mut socket, &error_response).await.unwrap();
                                             continue;
-                                        },
+                                        }
                                     };
                                     if(cmd_name == "SUBSCRIBE"){
                                         if arr.len() < 2 {
                                             let error_response = RespValue::Error("ERR wrong number of arguments for SUBSCRIBE".to_string());
-                                            let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                            socket.write_all(&resp_bytes).await.unwrap();
-                                            socket.flush().await.unwrap();
+                                            write_response(&mut socket, &error_response).await.unwrap();
                                             continue;
                                         }
                                         for item in &arr[1..]{
@@ -90,24 +83,17 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                                 RespValue::SimpleString(s) => s.clone(),
                                                 _ => {
                                                     let error_response = RespValue::Error("ERR invalid channel name".to_string());
-                                                    let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                                    socket.write_all(&resp_bytes).await.unwrap();
-                                                    socket.flush().await.unwrap();
+                                                    write_response(&mut socket, &error_response).await.unwrap();
                                                     continue;
                                                 },
                                             };
-                                            let receiver = {
-                                                let mut pubsub = pubsub_clone.lock().unwrap();
-                                                pubsub.subscribe(&channel)
-                                            };
-                                            stream_map.insert(channel.clone(), BroadcastStream::new(receiver));
+                                            handle_subscribe(&mut pubsub_clone.lock().unwrap(), &channel, &mut stream_map);
                                             let response = RespValue::Array(Some(vec![
                                                 RespValue::BulkString(Some(b"subscribe".to_vec())),
                                                 RespValue::BulkString(Some(channel.as_bytes().to_vec())),
                                                 RespValue::Integer(stream_map.len() as i64),
                                             ]));
-                                            let resp_bytes = RespEncoder::encode_resp(&response);
-                                            socket.write_all(&resp_bytes).await.unwrap();
+                                            write_response(&mut socket, &response).await.unwrap();
                                             socket.flush().await.unwrap();
                                         }
 
@@ -135,25 +121,17 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                                 RespValue::SimpleString(s) => s.clone(),
                                                 _ => {
                                                     let error_response = RespValue::Error("ERR invalid channel name".to_string());
-                                                    let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                                    socket.write_all(&resp_bytes).await.unwrap();
-                                                    socket.flush().await.unwrap();
+                                                    write_response(&mut socket, &error_response).await.unwrap();
                                                     continue;
                                                 },
                                             };
-                                            {
-                                                let mut pubsub = pubsub_clone.lock().unwrap();
-                                                pubsub.unsubscribe(&channel);
-                                            }
-                                            stream_map.remove(&channel);
+                                            handle_unsubscribe(&mut pubsub_clone.lock().unwrap(), &channel, &mut stream_map);
                                             let response = RespValue::Array(Some(vec![
                                                 RespValue::BulkString(Some(b"unsubscribe".to_vec())),
                                                 RespValue::BulkString(Some(channel.as_bytes().to_vec())),
                                                 RespValue::Integer(stream_map.len() as i64),
                                             ]));
-                                            let resp_bytes = RespEncoder::encode_resp(&response);
-                                            socket.write_all(&resp_bytes).await.unwrap();
-                                            socket.flush().await.unwrap();
+                                            write_response(&mut socket, &response).await.unwrap();
                                         }
 
                                     }
@@ -161,24 +139,18 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                         let (resp_tx, resp_rx) = oneshot::channel();
                                         tx_clone.send((resp_value.clone(), resp_tx)).await.unwrap();
                                         if let Ok(response) = resp_rx.await {
-                                            let resp_bytes = RespEncoder::encode_resp(&response);
-                                            socket.write_all(&resp_bytes).await.unwrap();
-                                            socket.flush().await.unwrap();
+                                            write_response(&mut socket, &response).await.unwrap();
                                         }
                                     }
                                     else {
                                         // subscribe mode can't execute other commands, only subscribe and unsubscribe
                                         let error_response = RespValue::Error("ERR only SUBSCRIBE and UNSUBSCRIBE commands are allowed in subscribe mode".to_string());
-                                        let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                        socket.write_all(&resp_bytes).await.unwrap();
-                                        socket.flush().await.unwrap();
+                                        write_response(&mut socket, &error_response).await.unwrap();
                                     }
                                 }
                                 _ => {
                                     let error_response = RespValue::Error("ERR invalid command format".to_string());
-                                    let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                    socket.write_all(&resp_bytes).await.unwrap();
-                                    socket.flush().await.unwrap();
+                                    write_response(&mut socket, &error_response).await.unwrap();
                                 }
                             }}
                             Ok(None) => {
@@ -188,7 +160,7 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                     let channels: Vec<String> = stream_map.keys().cloned().collect();
                                     let mut pubsub = pubsub_clone.lock().unwrap();
                                     for channel in &channels {
-                                        pubsub.unsubscribe(channel);
+                                        handle_unsubscribe(&mut pubsub, channel, &mut stream_map);
                                     }
                                     return;  // 退出整个 Task
                                 }
@@ -198,7 +170,7 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                     let channels: Vec<String> = stream_map.keys().cloned().collect();
                                     let mut pubsub = pubsub_clone.lock().unwrap();
                                     for channel in &channels {
-                                        pubsub.unsubscribe(channel);
+                                        handle_unsubscribe(&mut pubsub, channel, &mut stream_map);
                                     }
                                     return;  // 退出整个 Task
                                 }
@@ -215,9 +187,7 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                 RespValue::BulkString(Some(channel.as_bytes().to_vec())),
                                 RespValue::BulkString(Some(message.as_bytes().to_vec())),
                             ]));
-                            let resp_bytes = RespEncoder::encode_resp(&response);
-                            socket.write_all(&resp_bytes).await.unwrap();
-                            socket.flush().await.unwrap();
+                            write_response(&mut socket, &response).await.unwrap();
                         }
                          else => {
                             break;
@@ -227,18 +197,11 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                     if let Ok(Some(resp_value)) = parse.read_value(&mut socket).await {
                         match &resp_value {
                             RespValue::Array(Some(arr)) => {
-                                let cmd_name = match arr.first() {
-                                    Some(RespValue::BulkString(Some(bytes))) => {
-                                        String::from_utf8_lossy(bytes).to_ascii_uppercase()
-                                    }
-                                    Some(RespValue::SimpleString(s)) => s.to_ascii_uppercase(),
-                                    _ => {
-                                        let error_response = RespValue::Error(
-                                            "ERR invalid command name".to_string(),
-                                        );
-                                        let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                        socket.write_all(&resp_bytes).await.unwrap();
-                                        socket.flush().await.unwrap();
+                                let cmd_name = match parse_cmd_name(arr) {
+                                    Ok(name) => name,
+                                    Err(e) => {
+                                        let error_response = RespValue::Error(e);
+                                        write_response(&mut socket, &error_response).await.unwrap();
                                         continue;
                                     }
                                 };
@@ -248,8 +211,7 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                             "ERR wrong number of arguments for SUBSCRIBE"
                                                 .to_string(),
                                         );
-                                        let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                        socket.write_all(&resp_bytes).await.unwrap();
+                                        write_response(&mut socket, &error_response).await.unwrap();
                                         socket.flush().await.unwrap();
                                         continue;
                                     }
@@ -263,21 +225,11 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                                 let error_response = RespValue::Error(
                                                     "ERR invalid channel name".to_string(),
                                                 );
-                                                let resp_bytes =
-                                                    RespEncoder::encode_resp(&error_response);
-                                                socket.write_all(&resp_bytes).await.unwrap();
-                                                socket.flush().await.unwrap();
+                                                write_response(&mut socket, &error_response).await.unwrap();
                                                 continue;
                                             }
                                         };
-                                        let receiver = {
-                                            let mut pubsub = pubsub_clone.lock().unwrap();
-                                            pubsub.subscribe(&channel)
-                                        };
-                                        stream_map.insert(
-                                            channel.clone(),
-                                            BroadcastStream::new(receiver),
-                                        );
+                                        handle_subscribe(&mut pubsub_clone.lock().unwrap(), &channel, &mut stream_map);
                                         let response = RespValue::Array(Some(vec![
                                             RespValue::BulkString(Some(b"subscribe".to_vec())),
                                             RespValue::BulkString(Some(
@@ -285,9 +237,7 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                             )),
                                             RespValue::Integer(stream_map.len() as i64),
                                         ]));
-                                        let resp_bytes = RespEncoder::encode_resp(&response);
-                                        socket.write_all(&resp_bytes).await.unwrap();
-                                        socket.flush().await.unwrap();
+                                        write_response(&mut socket, &response).await.unwrap();
                                     }
                                 } else if cmd_name == "UNSUBSCRIBE" {
                                     // normal mode only return 0 when command is unsubscribe
@@ -296,25 +246,19 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
                                         RespValue::BulkString(None),
                                         RespValue::Integer(0),
                                     ]));
-                                    let resp_bytes = RespEncoder::encode_resp(&response);
-                                    socket.write_all(&resp_bytes).await.unwrap();
-                                    socket.flush().await.unwrap();
+                                    write_response(&mut socket, &response).await.unwrap();
                                 } else {
                                     let (resp_tx, resp_rx) = oneshot::channel();
                                     tx_clone.send((resp_value.clone(), resp_tx)).await.unwrap();
                                     if let Ok(response) = resp_rx.await {
-                                        let resp_bytes = RespEncoder::encode_resp(&response);
-                                        socket.write_all(&resp_bytes).await.unwrap();
-                                        socket.flush().await.unwrap();
+                                        write_response(&mut socket, &response).await.unwrap();
                                     }
                                 }
                             }
                             _ => {
                                 let error_response =
                                     RespValue::Error("ERR invalid command format".to_string());
-                                let resp_bytes = RespEncoder::encode_resp(&error_response);
-                                socket.write_all(&resp_bytes).await.unwrap();
-                                socket.flush().await.unwrap();
+                                write_response(&mut socket, &error_response).await.unwrap();
                             }
                         }
                     } else {
@@ -327,6 +271,30 @@ pub async fn run_server(addr: &str) -> io::Result<()> {
     }
 }
 
+fn handle_subscribe(pubsub: &mut PubSub, channel: &str, stream_map: &mut StreamMap<String, BroadcastStream<String>>){
+    let receiver = pubsub.subscribe(channel);
+    stream_map.insert(channel.to_string(), BroadcastStream::new(receiver));
+}
+
+fn handle_unsubscribe(pubsub: &mut PubSub, channel: &str, stream_map: &mut StreamMap<String, BroadcastStream<String>>){
+    let receiver = pubsub.unsubscribe(channel);
+    stream_map.remove(channel);
+}
+
+fn parse_cmd_name(resp_array: &Vec<RespValue>) -> Result<String, String> {
+    match resp_array.first() {
+        Some(RespValue::BulkString(Some(bytes))) => Ok(String::from_utf8_lossy(bytes).to_ascii_uppercase().to_string()),
+        Some(RespValue::SimpleString(s)) => Ok(s.to_ascii_uppercase()),
+        _ => Err("ERR invalid command name".to_string()),
+    }
+}
+
+async fn write_response(socket: &mut TcpStream, response: &RespValue) -> io::Result<()> {
+    let resp_bytes = RespEncoder::encode_resp(response);
+    socket.write_all(&resp_bytes).await?;
+    socket.flush().await
+}
+
 fn execute_command(command: &RespValue, _db: &mut Database, pubsub: &mut PubSub) -> RespValue {
     // 命令必须是 Array
     let array = match command {
@@ -335,12 +303,9 @@ fn execute_command(command: &RespValue, _db: &mut Database, pubsub: &mut PubSub)
     };
 
     // 命令名是第一个元素（Bulk String 或 Simple String）
-    let cmd_name = match array.first() {
-        Some(RespValue::BulkString(Some(bytes))) => {
-            String::from_utf8_lossy(bytes).to_ascii_uppercase()
-        }
-        Some(RespValue::SimpleString(s)) => s.to_ascii_uppercase(),
-        _ => return RespValue::Error("ERR invalid command name".to_string()),
+    let cmd_name = match parse_cmd_name(&array) {
+        Ok(name) => name,
+        Err(e) => return RespValue::Error(e),
     };
 
     match cmd_name.as_str() {
